@@ -637,11 +637,25 @@ FileIO::lockShared(const std::string &uuid)
   timeval tm;
   tm.tv_sec = FILE_LOCK_DURATION;
   tm.tv_usec = 0;
+
+  size_t sleepAcc = 1;
   while ((ret = mPool->ioctx.lock_shared(inode(), FILE_STRIPE_LOCKER,
                                          FILE_STRIPE_LOCKER_COOKIE_WRITE,
                                          FILE_STRIPE_LOCKER_TAG, "", &tm,
                                          0)) == -EBUSY)
-  {}
+  {
+    sleepAcc = std::min((size_t) 1000, sleepAcc * 2);
+    boost::this_thread::sleep_for(boost::chrono::milliseconds(sleepAcc));
+    boost::unique_lock<boost::mutex> lock(mLockMutex);
+
+    if (mLocking)
+    {
+      radosfs_debug("Looped %p by opid='%s' to try to share lock it "
+                    "but it is already locked (stopping the loop): ", this,
+                    uuid.c_str());
+      return;
+    }
+  }
 
   boost::unique_lock<boost::mutex> lock(mLockMutex);
   mLocking = true;
@@ -671,10 +685,24 @@ FileIO::lockExclusive(const std::string &uuid)
   timeval tm;
   tm.tv_sec = FILE_LOCK_DURATION;
   tm.tv_usec = 0;
+
+  size_t sleepAcc = 1;
   while ((ret = mPool->ioctx.lock_exclusive(inode(), FILE_STRIPE_LOCKER,
                                             FILE_STRIPE_LOCKER_COOKIE_OTHER,
                                             "", &tm, 0)) != 0)
-  {}
+  {
+    sleepAcc = std::min((size_t) 1000, sleepAcc * 2);
+    boost::this_thread::sleep_for(boost::chrono::milliseconds(sleepAcc));
+    boost::unique_lock<boost::mutex> lock(mLockMutex);
+
+    if (mLocking)
+    {
+      radosfs_debug("Looped %p by opid='%s' to try to lock it exclusively "
+                    "but it is already locked (stopping the loop): ", this,
+                    uuid.c_str());
+      return;
+    }
+  }
 
   boost::unique_lock<boost::mutex> lock(mLockMutex);
   mLocking = true;
