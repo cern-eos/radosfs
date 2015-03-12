@@ -81,7 +81,7 @@ FileIO::FileIO(Filesystem *radosFs, const PoolSP pool, const std::string &iNode,
     mPath(""),
     mStripeSize(stripeSize),
     mLazyRemoval(false),
-    mLocker(""),
+    mLocking(false),
     mInlineBuffer(0),
     mHasBackLink(false)
 {
@@ -96,7 +96,7 @@ FileIO::FileIO(Filesystem *radosFs, const PoolSP pool, const std::string &iNode,
     mPath(path),
     mStripeSize(stripeSize),
     mLazyRemoval(false),
-    mLocker(""),
+    mLocking(false),
     mInlineBuffer(0),
     // If the path is not set, then we assume the backlink has been set in order
     // to avoid trying to do it when needed
@@ -628,12 +628,9 @@ FileIO::lockShared(const std::string &uuid)
     seconds = boost::chrono::system_clock::now() - mLockStart;
     if (seconds.count() < FILE_LOCK_DURATION - 1)
     {
-      radosfs_debug("Keep shared lock: %s %s", mLocker.c_str(), uuid.c_str());
-      if (mLocker == "")
-        mLocker = uuid;
-
-      if (mLocker == uuid)
-        return;
+      radosfs_debug("Keep shared lock: %p by opid='%s'", this, uuid.c_str());
+      mLocking = true;
+      return;
     }
   }
 
@@ -647,10 +644,10 @@ FileIO::lockShared(const std::string &uuid)
   {}
 
   boost::unique_lock<boost::mutex> lock(mLockMutex);
-  mLocker = uuid;
+  mLocking = true;
   mLockStart = boost::chrono::system_clock::now();
 
-  radosfs_debug("Set/renew shared lock: %s ", mLocker.c_str());
+  radosfs_debug("Set/renew shared lock: %p by opid='%s'", this, uuid.c_str());
 }
 
 void
@@ -665,14 +662,9 @@ FileIO::lockExclusive(const std::string &uuid)
     seconds = boost::chrono::system_clock::now() - mLockStart;
     if (seconds.count() < FILE_LOCK_DURATION - 1)
     {
-      radosfs_debug("Keep exclusive lock: %s %s", mLocker.c_str(), uuid.c_str());
-      if (mLocker == "")
-      {
-        mLocker = uuid;
-      }
-
-      if (mLocker == uuid)
-        return;
+      radosfs_debug("Keep exclusive lock: %p by opid='%s'", this, uuid.c_str());
+      mLocking = true;
+      return;
     }
   }
 
@@ -685,10 +677,10 @@ FileIO::lockExclusive(const std::string &uuid)
   {}
 
   boost::unique_lock<boost::mutex> lock(mLockMutex);
-  mLocker = uuid;
+  mLocking = true;
   mLockStart = boost::chrono::system_clock::now();
 
-  radosfs_debug("Set/renew exclusive lock: %s ", mLocker.c_str());
+  radosfs_debug("Set/renew exclusive lock: %p by opid='%s'", this, uuid.c_str());
 }
 
 void
@@ -696,7 +688,7 @@ FileIO::unlockShared()
 {
   mPool->ioctx.unlock(inode(), FILE_STRIPE_LOCKER,
                       FILE_STRIPE_LOCKER_COOKIE_WRITE);
-  mLocker = "";
+  mLocking = false;
   radosfs_debug("Unlocked shared lock.");
 }
 
@@ -705,7 +697,7 @@ FileIO::unlockExclusive()
 {
   mPool->ioctx.unlock(inode(), FILE_STRIPE_LOCKER,
                       FILE_STRIPE_LOCKER_COOKIE_OTHER);
-  mLocker = "";
+  mLocking = false;
   radosfs_debug("Unlocked exclusive lock.");
 }
 
@@ -1176,7 +1168,7 @@ FileIO::manageIdleLock(double idleTimeout)
 {
   if (mLockMutex.try_lock())
   {
-    if (mLocker == "")
+    if (!mLocking)
     {
       boost::chrono::duration<double> seconds;
       seconds = boost::chrono::system_clock::now() - mLockStart;
@@ -1205,7 +1197,7 @@ FileIO::syncAndResetLocker(AsyncOpSP op)
 {
   boost::unique_lock<boost::mutex> lock(mLockMutex);
   op->waitForCompletion();
-  mLocker = "";
+  mLocking = false;
 }
 
 bool

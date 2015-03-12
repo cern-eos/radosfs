@@ -183,7 +183,7 @@ private:
   std::vector<rados_completion_t> mCompletionList;
   boost::chrono::system_clock::time_point mLockStart;
   boost::mutex mLockMutex;
-  std::string mLocker;
+  bool mLocking;
   OpsManager mOpManager;
   boost::scoped_ptr<FileInlineBuffer> mInlineBuffer;
   std::string mInlineMemBuffer;
