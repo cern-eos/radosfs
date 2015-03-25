@@ -817,7 +817,7 @@ FilesystemPriv::addPool(const std::string &name, const std::string &prefix,
 
   if (prefix == "")
   {
-    radosfs_debug("The pool's prefix cannot be an empty string");
+    radosfs_debug("The pool's prefix cannot be an empty string %s", name.c_str());
     return -EINVAL;
   }
 

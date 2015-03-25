@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sstream>
 
+#include "Callback.hh"
 #include "FileIO.hh"
 #include "FileInode.hh"
 #include "FileInodePriv.hh"
@@ -205,11 +206,11 @@ FileInode::read(char *buff, off_t offset, size_t blen)
 
 int
 FileInode::read(const std::vector<FileReadData> &intervals,
-                std::string *asyncOpId)
+                std::string *asyncOpId, Callback callback)
 {
   std::string opId;
 
-  int ret = mPriv->io->read(intervals, &opId);
+  int ret = mPriv->io->read(intervals, &opId, callback);
 
   {
     boost::unique_lock<boost::mutex> lock(mPriv->asyncOpsMutex);
@@ -229,7 +230,7 @@ FileInode::write(const char *buff, off_t offset, size_t blen)
 }
 
 int
-FileInode::write(const char *buff, off_t offset, size_t blen, bool copyBuffer)
+FileInode::write(const char *buff, off_t offset, size_t blen, bool copyBuffer, Callback callback)
 {
   if (!mPriv->io)
     return -ENODEV;
@@ -239,7 +240,7 @@ FileInode::write(const char *buff, off_t offset, size_t blen, bool copyBuffer)
   stat.translatedPath = mPriv->io->inode();
 
   std::string opId;
-  int ret = mPriv->io->write(buff, offset, blen, &opId, copyBuffer);
+  int ret = mPriv->io->write(buff, offset, blen, &opId, copyBuffer, callback);
 
   {
     boost::unique_lock<boost::mutex> lock(mPriv->asyncOpsMutex);

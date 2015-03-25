@@ -249,7 +249,6 @@ FileIO::onReadInlineBufferCompleted(rados_completion_t comp, void *arg)
     librados::bufferlist buff = (*it).second;
     FileInlineBuffer::readInlineBuffer(buff, 0, &contents);
 
-    radosfs_debug("Inline buffer read (size=%u).", contents.size());
 
     for (size_t i = 0; i < args->readData.size(); i++)
     {
@@ -390,7 +389,7 @@ FileIO::vectorReadStripe(size_t fileStripe,
 }
 
 int
-FileIO::read(const std::vector<FileReadData> &intervals, std::string *asyncOpId)
+FileIO::read(const std::vector<FileReadData> &intervals, std::string *asyncOpId, Callback callback)
 {
   mOpManager.sync();
 
@@ -400,7 +399,7 @@ FileIO::read(const std::vector<FileReadData> &intervals, std::string *asyncOpId)
     return -EINVAL;
   }
 
-  AsyncOpSP asyncOp(new AsyncOp(generateUuid()));
+  AsyncOpSP asyncOp(new AsyncOp(generateUuid(), callback));
   mOpManager.addOperation(asyncOp);
 
   if (asyncOpId)
@@ -568,14 +567,14 @@ FileIO::writeSync(const char *buff, off_t offset, size_t blen)
 
 int
 FileIO::write(const char *buff, off_t offset, size_t blen, std::string *opId,
-              bool copyBuffer)
+              bool copyBuffer, Callback callback)
 {
   int ret = 0;
 
   if ((ret = verifyWriteParams(offset, blen)) != 0)
     return ret;
 
-  AsyncOpSP asyncOp(new AsyncOp(generateUuid()));
+  AsyncOpSP asyncOp(new AsyncOp(generateUuid(),callback)); 
   mOpManager.addOperation(asyncOp);
 
   if (opId)

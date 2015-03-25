@@ -118,10 +118,11 @@ public:
 
   ssize_t read(char *buff, off_t offset, size_t blen);
 
-  int read(const std::vector<FileReadData> &intervals, std::string *asyncOpId=0);
+  int read(const std::vector<FileReadData> &intervals, std::string *asyncOpId=0, Callback callback = Callback());
 
   int write(const char *buff, off_t offset, size_t blen, std::string *opId = 0,
-            bool copyBuffer=false);
+            bool copyBuffer=false, Callback callback = Callback());
+
   int writeSync(const char *buff, off_t offset, size_t blen);
 
   std::string inode(void) const { return mInode; }

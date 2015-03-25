@@ -25,11 +25,12 @@
 
 RADOS_FS_BEGIN_NAMESPACE
 
-AyncOpPriv::AyncOpPriv(const std::string &id)
+AyncOpPriv::AyncOpPriv(const std::string &id, radosfs::Callback callback)
   : id(id),
     complete(false),
     returnCode(-EINPROGRESS),
-    ready(-1)
+    ready(-1),
+    callBack(callback)
 {}
 
 AyncOpPriv::~AyncOpPriv()
@@ -50,7 +51,6 @@ AyncOpPriv::waitForCompletion(void)
   while (returnCode == -EINPROGRESS)
   {
     boost::unique_lock<boost::mutex> lock(mOpMutex);
-
     if (ready != 0)
       continue;
 
@@ -85,6 +85,13 @@ AyncOpPriv::waitForCompletion(void)
 
   complete = true;
 
+  if (callBack.call) {
+    radosfs_debug("Async op with id='%s' calling back. ", id.c_str());
+    (*callBack.call)(&callBack.data);
+  } else {
+    radosfs_debug("Async op with id='%s' never calling back. retc=%d", id.c_str(), callBack.data.retc);
+  }
+
   return returnCode;
 }
 
@@ -110,13 +117,22 @@ AyncOpPriv::setReady()
 void
 AyncOpPriv::setPartialReady()
 {
-  boost::unique_lock<boost::mutex> lock(mOpMutex);
-  if (ready > 0)
-    ready--;
+  bool dowait=false;
+  {
+    boost::unique_lock<boost::mutex> lock(mOpMutex);
+    if (ready > 0)
+      ready--;
+    
+    if (!ready)
+      dowait = true;
+  }
+
+  if (dowait)
+    waitForCompletion();
 }
 
-AsyncOp::AsyncOp(const std::string &id)
-  : mPriv(new AyncOpPriv(id))
+AsyncOp::AsyncOp(const std::string &id, Callback callback)
+  : mPriv(new AyncOpPriv(id, callback))
 {}
 
 AsyncOp::~AsyncOp()

@@ -57,7 +57,7 @@ if( NOT NO_SOURCE )
   endif()
 
   add_subdirectory( src )
-  add_subdirectory( test )
+#  add_subdirectory( test )
   add_subdirectory( benchmark )
   add_subdirectory( tools )
 endif( NOT NO_SOURCE )
