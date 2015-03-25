@@ -18,7 +18,7 @@
 
 set( VERSION_MAJOR "0" )
 set( VERSION_MINOR "5" )
-set( VERSION_PATCH "3")
+set( VERSION_PATCH "4")
 set( RELEASE       "1")
 
 cmake_minimum_required( VERSION 2.6 )
@@ -57,7 +57,7 @@ if( NOT NO_SOURCE )
   endif()
 
   add_subdirectory( src )
-#  add_subdirectory( test )
+  add_subdirectory( test )
   add_subdirectory( benchmark )
   add_subdirectory( tools )
 endif( NOT NO_SOURCE )
