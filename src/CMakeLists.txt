@@ -50,7 +50,7 @@ add_library( radosfs SHARED
              FileIO.cc FileIO.hh
              Logger.cc Logger.hh
              Finder.cc Finder.hh
-             AsyncOp.cc AsyncOp.cc AsyncOpPriv.hh
+             AsyncOp.cc AsyncOp.cc AsyncOpPriv.hh Callback.hh
              FileInode.cc FileInode.hh FileInodePriv.hh
              FileInlineBuffer.cc FileInlineBuffer.hh
 )
@@ -71,7 +71,7 @@ endif( Linux )
 
 install( TARGETS radosfs LIBRARY DESTINATION ${LIB_INSTALL_DIR} )
 install( FILES
-         Filesystem.hh Dir.hh File.hh FsObj.hh FileInode.hh
+         Filesystem.hh Dir.hh File.hh FsObj.hh FileInode.hh Callback.hh
          DESTINATION include/radosfs )
 install( FILES
          libradosfs.hh

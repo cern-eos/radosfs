@@ -23,6 +23,7 @@
 #include <boost/scoped_ptr.hpp>
 
 #include "Filesystem.hh"
+#include "Callback.hh"
 
 RADOS_FS_BEGIN_NAMESPACE
 
@@ -41,11 +42,11 @@ public:
 
   ssize_t read(char *buff, off_t offset, size_t blen);
 
-  int read(const std::vector<FileReadData> &intervals, std::string *asyncOpId);
+  int read(const std::vector<FileReadData> &intervals, std::string *asyncOpId, Callback callback = Callback() );
 
   int write(const char *buff, off_t offset, size_t blen);
 
-  int write(const char *buff, off_t offset, size_t blen, bool copyBuffer);
+  int write(const char *buff, off_t offset, size_t blen, bool copyBuffer, Callback callback = Callback());
 
   int writeSync(const char *buff, off_t offset, size_t blen);
 

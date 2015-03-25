@@ -24,6 +24,7 @@
 #include <rados/librados.hpp>
 
 #include "radosfsdefines.h"
+#include "Callback.hh"
 
 RADOS_FS_BEGIN_NAMESPACE
 
@@ -32,7 +33,7 @@ typedef std::vector<librados::AioCompletion *> CompletionList;
 class AyncOpPriv
 {
 public:
-  AyncOpPriv(const std::string &id);
+  AyncOpPriv(const std::string &id, radosfs::Callback callback = Callback());
   ~AyncOpPriv(void);
 
   int waitForCompletion(void);
@@ -44,10 +45,12 @@ public:
   bool complete;
   int returnCode;
   int ready;
+  Callback callBack;
 
 private:
   boost::mutex mOpMutex;
   CompletionList mOperations;
+
 };
 
 RADOS_FS_END_NAMESPACE

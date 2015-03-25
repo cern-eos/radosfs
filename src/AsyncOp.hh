@@ -27,18 +27,20 @@
 #include <stdint.h>
 #include <vector>
 #include <memory>
+#include "Callback.hh"
 
 #define RADOS_FS_BEGIN_NAMESPACE namespace radosfs {
 #define RADOS_FS_END_NAMESPACE }
 
 RADOS_FS_BEGIN_NAMESPACE
 
+
 class AyncOpPriv;
 
 class AsyncOp
 {
 public:
-  AsyncOp(const std::string &id);
+  AsyncOp(const std::string &id, radosfs::Callback callback = Callback());
   ~AsyncOp(void);
 
   std::string id(void);
