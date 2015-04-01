@@ -433,6 +433,52 @@ FilesystemPriv::getIoService()
   return ioService;
 }
 
+int
+FilesystemPriv::resetFileEntry(Stat &fileStat)
+{
+  if (!fileStat.pool)
+    return -ENODEV;
+
+  std::string parentDir = getParentDir(fileStat.path, 0);
+  Stat parentStat;
+
+  int ret = stat(parentDir, &parentStat);
+
+  if (ret != 0)
+    return ret;
+
+  std::string omapFileEntry = XATTR_FILE_PREFIX +
+                              fileStat.path.substr(parentDir.length());
+  std::map<std::string, librados::bufferlist> omap;
+
+  std::string fileEntry = getFileXAttrDirRecord(&fileStat);
+  omap[omapFileEntry].append(fileEntry);
+
+  librados::ObjectWriteOperation writeOp;
+  writeOp.assert_exists();
+  writeOp.omap_set(omap);
+
+  return parentStat.pool->ioctx.operate(parentStat.translatedPath, &writeOp);
+}
+
+int
+FilesystemPriv::resetDirLogicalObj(Stat &dirStat)
+{
+  if (!dirStat.pool)
+    return -ENODEV;
+
+  std::map<std::string, librados::bufferlist> omap;
+  std::string inode = makeInodeXattr(&dirStat);
+
+  omap[XATTR_INODE].append(inode);
+
+  librados::ObjectWriteOperation writeOp;
+  writeOp.assert_exists();
+  writeOp.omap_set(omap);
+
+  return dirStat.pool->ioctx.operate(dirStat.path, &writeOp);
+}
+
 static size_t
 getInlineBufferCapacityFromExtraData(
                                  const std::map<std::string, std::string> &data)
@@ -945,10 +991,13 @@ FilesystemPriv::getMtdPoolFromName(const std::string &name)
   PoolMap::const_iterator it;
   for (it = mtdPoolMap.begin(); it != mtdPoolMap.end(); it++)
   {
-    pool = (*it).second;
+    PoolSP currentPool = (*it).second;
 
-    if (pool->name == name)
+    if (currentPool->name == name)
+    {
+      pool = currentPool;
       break;
+    }
   }
 
   return pool;
@@ -1080,6 +1129,37 @@ FilesystemPriv::getDataPools(const std::string &path)
 
   if (prefixFound != "")
     pools = poolMap[prefixFound];
+
+  return pools;
+}
+
+PoolList
+FilesystemPriv::getDataPools()
+{
+  PoolList pools;
+  boost::unique_lock<boost::mutex> lock(poolMutex);
+
+  PoolListMap::const_iterator it;
+  for (it = poolMap.begin(); it != poolMap.end(); it++)
+  {
+    const PoolList &list = (*it).second;
+    pools.insert(pools.end(), list.begin(), list.end());
+  }
+
+  return pools;
+}
+
+PoolList
+FilesystemPriv::getMtdPools()
+{
+  PoolList pools;
+  boost::unique_lock<boost::mutex> lock(mtdPoolMutex);
+
+  PoolMap::const_iterator it;
+  for (it = mtdPoolMap.begin(); it != mtdPoolMap.end(); it++)
+  {
+    pools.push_back((*it).second);
+  }
 
   return pools;
 }

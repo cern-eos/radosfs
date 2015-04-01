@@ -17,6 +17,7 @@
  * for more details.
  */
 
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <rados/librados.hpp>
@@ -29,398 +30,875 @@
 #include "RadosFsChecker.hh"
 #include "FilesystemPriv.hh"
 
-static int
-getObjectsFromCluster(Pool *pool, const std::string &prefix,
-                      std::map<std::string, std::string> &entries)
+#define ANIMATION_STEP_TIMEOUT 150 // ms
+
+void
+RadosFsChecker::generalWorkerThread(
+    boost::shared_ptr<boost::asio::io_service> ioService)
 {
-  librados::ObjectIterator it;
+  ioService->run();
+}
 
-  for (it = pool->ioctx.objects_begin(); it != pool->ioctx.objects_end(); it++)
+static std::map<ErrorCode, std::string>
+createErrorsDescription()
+{
+  std::map<ErrorCode, std::string> errorDescription;
+  errorDescription[NO_ENT] = "NO_ENT";
+  errorDescription[NO_LINK] = "NO_LINK";
+  errorDescription[NO_MTIME] = "NO_MTIME";
+  errorDescription[NO_CTIME] = "NO_CTIME";
+  errorDescription[NO_INODE] = "NO_INODE";
+  errorDescription[NO_MODE] = "NO_MODE";
+  errorDescription[NO_UID] = "NO_UID";
+  errorDescription[NO_GID] = "NO_GID";
+  errorDescription[NO_POOL] = "NO_POOL";
+  errorDescription[NO_INLINE_BUFFER_SIZE] = "NO_INLINE_BUFFER_SIZE";
+  errorDescription[NO_INLINEBUFFER] = "NO_INLINEBUFFER";
+  errorDescription[FILE_ENTRY_NO_LINK] = "FILE_ENTRY_NO_LINK";
+  errorDescription[EMPTY_FILE_ENTRY] = "EMPTY_FILE_ENTRY";
+  errorDescription[NO_BACK_LINK] = "NO_BACK_LINK";
+  errorDescription[WRONG_BACK_LINK] = "WRONG_BACK_LINK";
+  errorDescription[BACK_LINK_NO_ENT] = "BACK_LINK_NO_ENT";
+  errorDescription[NO_ERROR] = "NO_ERROR";
+  errorDescription[INODE_NO_SIZE] = "INODE_NO_SIZE";
+  errorDescription[LOOSE_INODE_STRIPE] = "LOOSE_INODE_STRIPE";
+  return errorDescription;
+}
+
+RadosFsChecker::RadosFsChecker(radosfs::Filesystem *radosFs, size_t numThreads)
+  : errorsDescription(createErrorsDescription()),
+    mRadosFs(radosFs),
+    ioService(new boost::asio::io_service),
+    asyncWork(new boost::asio::io_service::work(*ioService)),
+    mAnimationStep(0),
+    mAnimationLastUpdate(boost::chrono::system_clock::now()),
+    mAnimation("|/-\\"),
+    mVerbose(false),
+    mFix(false),
+    mDry(false)
+{
+  while (numThreads-- > 0)
+    generalWorkerThreads.create_thread(
+          boost::bind(&RadosFsChecker::generalWorkerThread, this, ioService));
+}
+
+static bool
+verifyPairsInEntry(const std::string &path,
+                   const std::string &entry, const char **keysToCheck,
+                   const ErrorCode *errorCodes,
+                   boost::shared_ptr<Diagnostic> diagnostic)
+{
+  bool noIssues = true;
+  std::map<std::string, std::string> entryMap;
+  entryMap = stringAttrsToMap(entry);
+
+  for (int i = 0; keysToCheck[i] != 0; i++)
   {
-    const std::string &obj = (*it).second;
+    std::map<std::string, std::string>::iterator it;
+    it = entryMap.find(keysToCheck[i]);
+    if (it == entryMap.end() || (*it).second == "")
+    {
+      Issue issue(path, errorCodes[i]);
 
-    if (prefix != obj && !nameIsStripe(obj))
-      entries[obj] = pool->name;
+      if (isDirPath(path))
+        diagnostic->addDirIssue(issue);
+      else
+        diagnostic->addFileIssue(issue);
+
+      noIssues = false;
+    }
+  }
+
+  return noIssues;
+}
+
+bool
+RadosFsChecker::verifyDirObject(Stat &stat,
+                                std::map<std::string, librados::bufferlist> &omap,
+                                DiagnosticSP diagnostic)
+{
+  log("Verifying dir object '%s'...\n", stat.path.c_str());
+  bool noIssues = true;
+  const char * keysToCheck[] = {XATTR_INODE_HARD_LINK, XATTR_CTIME, XATTR_MTIME,
+                                0};
+  const ErrorCode errorCodes[] = {NO_BACK_LINK, NO_CTIME, NO_MTIME, NO_ERROR};
+
+  for (int i = 0; keysToCheck[i] != 0; i++)
+  {
+    std::map<std::string, librados::bufferlist>::const_iterator it;
+    it = omap.find(keysToCheck[i]);
+
+    librados::bufferlist buff;
+
+    if (it != omap.end())
+      buff = (*it).second;
+
+    if (buff.length() == 0)
+    {
+      Issue issue(stat.path, errorCodes[i]);
+      issue.extraInfo = stat.translatedPath;
+
+      if (strcmp(keysToCheck[i], XATTR_INODE_HARD_LINK) == 0)
+      {
+        log("No back link set in '%s' (%s)!\n", stat.translatedPath.c_str(),
+            stat.path.c_str());
+        if (mFix)
+        {
+          int ret = 0;
+
+          log("Fixing back link in '%s' (%s)!\n", stat.translatedPath.c_str(),
+              stat.path.c_str());
+
+          if (!mDry)
+          {
+            ret = setDirInodeBackLink(stat.pool.get(), stat.translatedPath,
+                                      stat.path);
+          }
+
+          if (ret == 0)
+            issue.setFixed();
+        }
+      }
+
+      diagnostic->addDirIssue(issue);
+      noIssues = false;
+    }
+  }
+
+  std::map<std::string, librados::bufferlist>::const_iterator it;
+  it = omap.find(XATTR_PERMISSIONS);
+
+  if (it != omap.end())
+  {
+    const char * keysToCheck[] = {UID_KEY, GID_KEY, MODE_KEY, 0};
+    const ErrorCode errorCodes[] = {NO_UID, NO_GID, NO_MODE, NO_ERROR};
+
+    librados::bufferlist buff = (*it).second;
+    const std::string permissions(buff.c_str(), buff.length());
+
+    if (!verifyPairsInEntry(stat.path, permissions, keysToCheck, errorCodes,
+                            diagnostic))
+    {
+      noIssues = false;
+    }
+  }
+
+  return noIssues;
+}
+
+int
+RadosFsChecker::verifyFileObject(Stat &stat,
+                                 std::map<std::string, librados::bufferlist> &omap,
+                                 DiagnosticSP diagnostic)
+{
+  bool isLink = S_ISLNK(stat.statBuff.st_mode);
+  int ret = 0;
+  const std::string parentPath = getParentDir(stat.path, 0);
+  const std::string baseName = stat.path.substr(parentPath.length());
+  std::map<std::string, librados::bufferlist>::iterator it;
+
+  log("Verifying %s object '%s'...\n", isLink ? "link" : "file",
+      stat.path.c_str());
+
+  it = omap.find(XATTR_FILE_PREFIX + baseName);
+
+  if (it == omap.end())
+  {
+    log("'%s' has no entry in its parent!\n", stat.path.c_str());
+    Issue issue(stat.path, FILE_ENTRY_NO_LINK);
+    diagnostic->addFileIssue(issue);
+    return ret;
+  }
+
+  librados::bufferlist fileEntry = (*it).second;
+  const std::string fileEntryContents(fileEntry.c_str(), fileEntry.length());
+
+  if (fileEntryContents.empty())
+  {
+    log("'%s' has an empty entry in its parent!\n", stat.path.c_str());
+    Issue issue(stat.path, EMPTY_FILE_ENTRY);
+    diagnostic->addFileIssue(issue);
+    return ret;
+  }
+
+  std::map<std::string, std::string> fileEntryMap;
+  fileEntryMap = stringAttrsToMap(fileEntryContents);
+
+  const char * keysToCheck[] = {LINK_KEY, UID_KEY, GID_KEY, MODE_KEY, TIME_KEY,
+                                isLink ? 0 : XATTR_FILE_INLINE_BUFFER_SIZE,
+                                0};
+  const ErrorCode errorCodes[] = {NO_LINK, NO_UID, NO_GID, NO_MODE, NO_CTIME,
+                                  isLink ? NO_ERROR : NO_INLINE_BUFFER_SIZE,
+                                  NO_ERROR};
+
+  if (!verifyPairsInEntry(stat.path, fileEntryContents, keysToCheck, errorCodes,
+                          diagnostic))
+  {
+    return ret;
+  }
+
+  if (isLink)
+  {
+    Stat targetStat;
+    int ret = mRadosFs->mPriv->stat(stat.translatedPath, &targetStat);
+    if (ret != 0)
+    {
+      Issue issue(stat.path, ret);
+      issue.extraInfo.append("Error statting link target " +
+                             stat.translatedPath);
+      diagnostic->addFileIssue(issue);
+    }
+
+    return ret;
+  }
+
+  std::string backLink;
+  ret = getFileInodeBackLink(stat.pool.get(), stat.translatedPath, &backLink);
+
+  if (ret == -ENOENT)
+  {
+    // We can have files without the inode object so we return success when
+    // the file has no inode
+    return 0;
+  }
+
+  if (backLink != stat.path)
+  {
+    int errorCode;
+
+    if (backLink.empty())
+    {
+      errorCode = NO_BACK_LINK;
+      log("Inode '%s' (%s) has no backlink!\n", stat.translatedPath.c_str(),
+          stat.path.c_str());
+    }
+    else
+    {
+      errorCode = WRONG_BACK_LINK;
+      log("Inode '%s' (%s) has a wrong backlink!\n", stat.translatedPath.c_str(),
+          stat.path.c_str());
+    }
+
+    Issue issue(stat.path, errorCode);
+    issue.extraInfo = stat.translatedPath;
+
+    if (mFix)
+    {
+      int ret = 0;
+
+      log("Fixing back link in '%s' (%s)!\n", stat.translatedPath.c_str(),
+          stat.path.c_str());
+
+      if (!mDry)
+        ret = setFileInodeBackLink(stat.pool.get(), stat.translatedPath,
+                                   stat.path);
+
+      if (ret == 0)
+        issue.setFixed();
+    }
+
+    diagnostic->addFileIssue(issue);
+    return ret;
   }
 
   return 0;
 }
 
-RadosFsChecker::RadosFsChecker(radosfs::Filesystem *radosFs)
-  : mRadosFs(radosFs)
-{}
+void
+RadosFsChecker::checkPath(std::string path, DiagnosticSP diagnostic)
+{
+  log("Checking path '%s'...\n", path.c_str());
+  Stat stat;
+  int ret = mRadosFs->mPriv->stat(path, &stat);
 
-bool
-RadosFsChecker::checkPath(const std::string &path)
+  animate();
+
+  if (ret < 0)
+  {
+    log("Error statting path '%s': %s (%d)\n", path.c_str(), strerror(abs(ret)),
+        abs(ret));
+    Issue issue(path, ret);
+    diagnostic->addFileIssue(issue);
+    return;
+  }
+
+
+  if (S_ISLNK(stat.statBuff.st_mode) || S_ISREG(stat.statBuff.st_mode))
+  {
+    Stat parentStat;
+    std::string parentDir = getParentDir(stat.path, 0);
+    ret = mRadosFs->mPriv->stat(parentDir, &parentStat);
+
+    if (ret < 0)
+    {
+      Issue issue(parentDir, ret);
+      issue.extraInfo.append("When checking path " + path);
+      diagnostic->addDirIssue(issue);
+      return;
+    }
+
+    std::map<std::string, librados::bufferlist> omap;
+    parentStat.pool->ioctx.omap_get_vals(parentStat.translatedPath, "", "",
+                                         UINT_MAX, &omap);
+
+    verifyFileObject(stat, omap, diagnostic);
+  }
+  else if (S_ISDIR(stat.statBuff.st_mode))
+  {
+    std::map<std::string, librados::bufferlist> omap;
+    stat.pool->ioctx.omap_get_vals(stat.translatedPath, "", "", UINT_MAX, &omap);
+
+    verifyDirObject(stat, omap, diagnostic);
+  }
+}
+
+void
+RadosFsChecker::checkPathInThread(std::string path, DiagnosticSP diagnostic)
+{
+  ioService->post(boost::bind(&RadosFsChecker::checkPath, this, path,
+                              diagnostic));
+}
+
+void
+RadosFsChecker::checkDir(std::string path, bool recursive,
+                         boost::shared_ptr<Diagnostic> diagnostic)
 {
   Stat stat;
   int ret = mRadosFs->mPriv->stat(path, &stat);
 
-  if (ret != 0)
-  {
-    if (isDirPath(path))
-      mBrokenDirs[stat.path] = "";
-    else
-      mBrokenFiles.insert(stat.path);
+  animate();
 
-    return false;
-  }
+  log("Checking dir '%s'...\n", path.c_str());
 
-  struct stat statBuff;
-  if (S_ISLNK(stat.statBuff.st_mode))
+  if (ret < 0)
   {
-    if (mRadosFs->stat(stat.translatedPath, &statBuff) != 0)
-      mBrokenLinks[stat.path] = stat.translatedPath;
-  }
-  else if (S_ISDIR(stat.statBuff.st_mode))
-  {
-    mDirs.erase(stat.path);
-    return true;
-  }
-  else if (S_ISREG(stat.statBuff.st_mode))
-  {
-    if (mInodes.erase(stat.translatedPath) == 0)
-    {
-      mBrokenFiles.insert(stat.path);
-    }
-  }
+    Issue issue(path, ret);
+    diagnostic->addDirIssue(issue);
 
-  return false;
-}
+    log(" Error in '%s': %d\n", path.c_str(), ret);
 
-void
-RadosFsChecker::checkDirRecursive(const std::string &path)
-{
-  radosfs::Dir dir(mRadosFs, path);
-
-  if (!dir.exists())
-  {
-    mBrokenDirs[dir.path()] = "";
     return;
   }
+
+  if (S_ISLNK(stat.statBuff.st_mode))
+  {
+    fprintf(stderr, "Dir '%s' is actually a link pointing to '%s'. Check it as "
+                    "a path or check its target instead.\nAborting...",
+            stat.path.c_str(), stat.translatedPath.c_str());
+    exit(ENOTSUP);
+  }
+
+  radosfs::Dir dir(mRadosFs, path);
 
   dir.update();
 
   std::set<std::string> entries;
+  ret = dir.entryList(entries);
 
-  dir.entryList(entries);
+  if (ret < 0)
+  {
+    Issue issue(dir.path(), ret);
+    issue.errorCode = ret;
 
-  std::set<std::string>::const_iterator it;
+    log(" Error in '%s': %d\n", path.c_str(), ret);
+
+    diagnostic->addDirIssue(issue);
+  }
+
+  std::map<std::string, librados::bufferlist> omap;
+  stat.pool->ioctx.omap_get_vals(stat.translatedPath, "", "", UINT_MAX, &omap);
+
+  verifyDirObject(stat, omap, diagnostic);
+
+  std::set<std::string>::iterator it;
   for (it = entries.begin(); it != entries.end(); it++)
   {
-    const std::string &entry = dir.path() + *it;
-    if (checkPath(entry))
-      checkDirRecursive(entry);
-  }
-}
+    Stat stat;
+    const std::string entryName = *it;
+    const std::string entryPath = dir.path() + entryName;
+    ret = mRadosFs->mPriv->stat(entryPath, &stat);
 
-int
-RadosFsChecker::check()
-{
-  radosfs::PoolMap::const_iterator mtdMapIt;
-  radosfs::PoolListMap::const_iterator dataMapIt;
-  std::set<std::string> prefixes;
+    log(" Checking entry '%s' of '%s'\n", entryName.c_str(), dir.path().c_str());
 
-  fprintf(stdout, "Checking...\n");
-
-  for (mtdMapIt = mRadosFs->mPriv->mtdPoolMap.begin();
-       mtdMapIt != mRadosFs->mPriv->mtdPoolMap.end();
-       mtdMapIt++)
-  {
-    int ret;
-
-    ret = getObjectsFromCluster((*mtdMapIt).second.get(), (*mtdMapIt).first,
-                                mDirs);
-
-    if (ret != 0)
-      return ret;
-
-    prefixes.insert((*mtdMapIt).first);
-  }
-
-  for (dataMapIt = mRadosFs->mPriv->poolMap.begin();
-       dataMapIt != mRadosFs->mPriv->poolMap.end();
-       dataMapIt++)
-  {
-    int ret;
-
-    const radosfs::PoolList &pools = (*dataMapIt).second;
-    radosfs::PoolList::const_iterator poolIt;
-
-    for (poolIt = pools.begin(); poolIt != pools.end(); poolIt++)
+    if (ret < 0)
     {
-      ret = getObjectsFromCluster((*poolIt).get(), (*dataMapIt).first,
-                                  mInodes);
+      Issue issue(entryPath, ret);
 
-      if (ret != 0)
-        return ret;
+      if (isDirPath(entryPath))
+      {
+        log(" Error in '%s': %d\n", entryPath.c_str(), ret);
+
+        diagnostic->addDirIssue(issue);
+      }
+      else
+      {
+        if (ret == -ENOENT)
+          issue.errorCode = FILE_ENTRY_NO_LINK;
+
+        log(" Error in '%s': %d\n", entryPath.c_str(), issue.errorCode);
+
+        diagnostic->addFileIssue(issue);
+      }
+
+      continue;
+    }
+
+    if (S_ISLNK (stat.statBuff.st_mode) || S_ISREG (stat.statBuff.st_mode))
+    {
+      ret = verifyFileObject(stat, omap, diagnostic);
+      continue;
+    }
+    else if (recursive)
+    {
+      ioService->post(boost::bind(&RadosFsChecker::checkDir, this, entryPath,
+                                  recursive, diagnostic));
+    }
+    else
+    {
+      std::map<std::string, librados::bufferlist> omap;
+      stat.pool->ioctx.omap_get_vals(stat.translatedPath, "", "", UINT_MAX,
+                                     &omap);
+
+      verifyDirObject(stat, omap, diagnostic);
     }
   }
+}
 
-  std::set<std::string>::const_iterator setIt;
-  for (setIt = prefixes.begin(); setIt != prefixes.end(); setIt++)
-  {
-    checkDirRecursive(*setIt);
-  }
-
-  mBrokenInodes = mInodes;
-
-  return 0;
+void
+RadosFsChecker::checkDirInThread(std::string path, bool recursive,
+                                 DiagnosticSP diagnostic)
+{
+  ioService->post(boost::bind(&RadosFsChecker::checkDir, this, path, recursive,
+                              diagnostic));
 }
 
 int
-RadosFsChecker::fixDirs()
+RadosFsChecker::fixInodeBackLink(Stat &backLinkStat, const std::string &inode,
+                                 Pool &pool, Issue &issue)
 {
   int ret = 0;
-  std::map<std::string, std::string>::const_iterator it;
 
-  for (it = mBrokenDirs.begin(); it != mBrokenDirs.end(); it++)
+  if (!mDry)
   {
-    const std::string &path = (*it).first.c_str();
+    backLinkStat.translatedPath = inode;
 
-    if (mDry)
+    if (isDirPath(backLinkStat.path))
     {
-      fprintf(stdout, "Would create %s\n", path.c_str());
+      if (!backLinkStat.pool)
+        backLinkStat.pool =
+            mRadosFs->mPriv->getMetadataPoolFromPath(backLinkStat.path);
+
+      ret = mRadosFs->mPriv->resetDirLogicalObj(backLinkStat);
     }
     else
     {
-      radosfs::Dir dir(mRadosFs, path.c_str());
-
-      if ((ret = dir.create()) != 0)
-      {
-        fprintf(stderr, "Error creating directory %s: %s."
-                "Stopping the fixing...\n", path.c_str(),
-                strerror(ret));
-
-        return ret;
-      }
-
-      fprintf(stdout, "Created %s\n", dir.path().c_str());
+      ret = mRadosFs->mPriv->resetFileEntry(backLinkStat);
     }
   }
 
-  for (it = mDirs.begin(); it != mDirs.end(); it++)
+  if (ret == 0)
   {
-    const std::string &path = (*it).first.c_str();
-
-    if (mDry)
-    {
-      fprintf(stdout, "Would index %s\n", path.c_str());
-    }
-    else
-    {
-      Stat stat, parentStat;
-
-      mRadosFs->mPriv->stat(path, &stat);
-
-      std::string parentDir = getParentDir(path, 0);
-
-      mRadosFs->mPriv->stat(parentDir, &parentStat);
-
-      if ((ret = indexObject(&parentStat, &stat, '+')) != 0)
-      {
-        fprintf(stderr, "Error indexing %s: %s."
-                "Stopping the fixing...\n", stat.path.c_str(),
-                strerror(ret));
-
-        return ret;
-      }
-
-      fprintf(stdout, "Indexed %s\n", stat.path.c_str());
-    }
+    issue.extraInfo.append("Now points to '" + inode + "' in pool '"
+                           + pool.name + "'.");
+    issue.setFixed();
   }
 
   return ret;
 }
 
-int
-RadosFsChecker::fixInodes()
+void
+RadosFsChecker::checkInodeBackLink(const std::string &inode,
+                                   Pool &pool,
+                                   const std::string &backLink,
+                                   DiagnosticSP diagnostic)
 {
-  std::map<std::string, std::string>::const_iterator it;
-  for (it = mInodes.begin(); it != mInodes.end(); it++)
+  Stat backLinkStat;
+  backLinkStat.path = backLink;
+  PoolSP mtdPool = mRadosFs->mPriv->getMetadataPoolFromPath(backLink);
+  bool isDirBackLink = isDirPath(backLink);
+
+  int ret;
+
+  if (isDirBackLink)
+    ret = mRadosFs->mPriv->statDir(mtdPool, &backLinkStat);
+  else
+    ret = mRadosFs->mPriv->statFile(mtdPool, &backLinkStat);
+
+  if (ret != 0 && ret != -ENODATA && ret != -ENOLINK)
   {
-    radosfs::PoolListMap &poolMap = mRadosFs->mPriv->poolMap;
-    radosfs::PoolListMap::iterator poolIt;
-    const std::string &inode = (*it).first;
-    librados::bufferlist backLink;
-
-    // retrieve the inode back link from the correct pool
-    for (poolIt = poolMap.begin(); poolIt != poolMap.end(); poolIt++)
+    Issue issue(inode, WRONG_BACK_LINK);
+    issue.extraInfo.append("problem statting inode's backlink '" + backLink +
+                           ".");
+    diagnostic->addInodeIssue(issue);
+  }
+  else if (inode != backLinkStat.translatedPath)
+  {
+    if (backLinkStat.translatedPath.empty())
     {
-      const radosfs::PoolList &poolList = (*poolIt).second;
-      radosfs::PoolList::const_iterator poolListIt;
+      Issue issue(backLinkStat.path, NO_INODE);
 
-      for (poolListIt = poolList.begin();
-           poolListIt != poolList.end();
-           poolListIt++)
-      {
-        std::set<std::string> keys;
-        std::map<std::string, librados::bufferlist> omap;
+      if (mFix)
+        ret = fixInodeBackLink(backLinkStat, inode, pool, issue);
 
-        keys.insert(XATTR_INODE_HARD_LINK);
-        int ret = (*poolListIt)->ioctx.omap_get_vals_by_keys(inode, keys, &omap);
-
-        if (ret == 0 && omap.count(XATTR_INODE_HARD_LINK) > 0)
-        {
-          backLink = omap[XATTR_INODE_HARD_LINK];
-          break;
-        }
-      }
-
-      if (backLink.length() > 0)
-        break;
+      if (isDirBackLink)
+        diagnostic->addDirIssue(issue);
+      else
+        diagnostic->addFileIssue(issue);
     }
+    else
+    {
+      Issue issue(inode, WRONG_BACK_LINK);
+      issue.extraInfo.append(backLinkStat.path + " points to '" +
+                             backLinkStat.translatedPath + "' in pool '" +
+                             backLinkStat.pool->name + "' instead.");
+      diagnostic->addInodeIssue(issue);
+    }
+  }
+}
 
-    std::string action;
-    if (backLink.length() > 0)
+void
+RadosFsChecker::checkInodeKeys(const std::string &inode, Pool &pool,
+                        const std::map<std::string, librados::bufferlist> &keys,
+                        DiagnosticSP diagnostic, bool isFile)
+{
+  std::map<std::string, librados::bufferlist>::const_iterator it;
+
+  it = keys.find(XATTR_INODE_HARD_LINK);
+  if (it == keys.end())
+  {
+    log("Inode '%s' has no back link\n", inode.c_str());
+    Issue issue(inode, NO_BACK_LINK);
+    diagnostic->addInodeIssue(issue);
+  }
+  else
+  {
+    librados::bufferlist backLink = (*it).second;
+    if (backLink.length() == 0)
+    {
+      log("Inode '%s' has the wrong back link\n", inode.c_str());
+      Issue issue(inode, WRONG_BACK_LINK);
+      diagnostic->addInodeIssue(issue);
+    }
+    else if (mHasPools)
     {
       std::string backLinkStr(backLink.c_str(), backLink.length());
-
-      if (mDry)
-      {
-        action = "Would create";
-      }
-      else
-      {
-        action = "Created";
-
-        PoolSP pool;
-        Stat stat, parentStat;
-
-        pool = mRadosFs->mPriv->getMetadataPoolFromPath(backLinkStr);
-
-        if (!pool.get())
-        {
-          fprintf(stderr, "Failed to get metadata pool for %s (to point to "
-                  "%s)\n", backLinkStr.c_str(), inode.c_str());
-
-          return -ENODEV;
-        }
-
-        stat.path = backLinkStr;
-        stat.pool = pool;
-        // We just need it to be a file. The permissions are already
-        // set on the inode
-        stat.statBuff.st_mode = S_IFREG;
-        stat.translatedPath = inode;
-
-        std::string parentDir = getParentDir(stat.path, 0);
-        mRadosFs->mPriv->stat(parentDir, &parentStat);
-
-        indexObject(&parentStat, &stat, '+');
-      }
-
-      fprintf(stdout, "%s %s (pointing to %s)\n", action.c_str(),
-              backLinkStr.c_str(), inode.c_str());
+      checkInodeBackLink(inode, pool, backLinkStr, diagnostic);
     }
-    else
+  }
+
+  it = keys.find(XATTR_MTIME);
+  if (it == keys.end())
+  {
+    log("Inode '%s' has no mtime\n", inode.c_str());
+    Issue issue(inode, NO_MTIME);
+    diagnostic->addInodeIssue(issue);
+  }
+
+  if (isFile)
+  {
+    it = keys.find(XATTR_FILE_SIZE);
+    if (it == keys.end())
     {
-      if (mDry)
-      {
-        action = "Would ignore this inode...";
-      }
-      else
-      {
-        action = "Ignored this inode...";
-      }
+      log("Inode '%s' has no size\n", inode.c_str());
+      Issue issue(inode, INODE_NO_SIZE);
+      diagnostic->addInodeIssue(issue);
+    }
+  }
+}
 
-      fprintf(stderr, "Cannot find the file path linking to %s. %s\n",
-              inode.c_str(), action.c_str());
+void
+RadosFsChecker::checkInode(PoolSP pool, std::string inode,
+                           boost::shared_ptr<Diagnostic> diagnostic)
+{
+  animate();
+
+  log("Checking inode '%s'...\n", inode.c_str());
+
+  if (nameIsStripe(inode))
+  {
+    std::string baseInode = getBaseInode(inode);
+
+    if (pool->ioctx.stat(baseInode, 0, 0) != 0)
+    {
+      log("Inode stripe '%s' is loose!\n", inode.c_str());
+      Issue issue(inode, LOOSE_INODE_STRIPE);
+      issue.extraInfo.append("in pool '" + pool->name + "'");
+      diagnostic->addInodeIssue(issue);
+    }
+
+    return;
+  }
+
+  std::map<std::string, librados::bufferlist> *keyValueMap;
+  std::map<std::string, librados::bufferlist> xattrs;
+  std::map<std::string, librados::bufferlist> omap;
+
+  int getXattrsRet, getOmapRet;
+  librados::ObjectReadOperation readOp;
+  readOp.getxattrs(&xattrs, &getXattrsRet);
+  readOp.omap_get_vals("", XATTR_RADOSFS_PREFIX, UINT_MAX, &omap, &getOmapRet);
+
+  int ret = pool->ioctx.operate(inode, &readOp, 0);
+
+  bool inodeIsFile = false;
+
+  if (!omap.size() || xattrs.count(XATTR_FILE_SIZE) > 0)
+    inodeIsFile = true;
+
+  if (ret < 0)
+  {
+    log("Error getting the xattrs or omap of inode '%s': %s (%d)\n",
+        inode.c_str(), abs(ret), strerror(abs(ret)));
+    Issue issue(inode, ret);
+    diagnostic->addInodeIssue(issue);
+    return;
+  }
+
+  if (inodeIsFile)
+    keyValueMap = &xattrs;
+  else
+    keyValueMap = &omap;
+
+  checkInodeKeys(inode, *pool.get(), *keyValueMap, diagnostic, inodeIsFile);
+}
+
+void
+RadosFsChecker::checkInodeInThread(PoolSP pool, const std::string &inode,
+                                   DiagnosticSP diagnostic)
+{
+  if (!nameIsInode(inode))
+    return;
+
+  ioService->post(boost::bind(&RadosFsChecker::checkInode, this, pool,
+                              inode, diagnostic));
+}
+
+void
+RadosFsChecker::checkInodes(PoolSP pool, DiagnosticSP diagnostic)
+{
+  librados::ObjectIterator it;
+
+  for (it = pool->ioctx.objects_begin(); it != pool->ioctx.objects_end(); it++)
+  {
+    const std::string &inode = (*it).first;
+    checkInodeInThread(pool, inode, diagnostic);
+  }
+}
+
+void
+RadosFsChecker::checkInodesInThread(PoolSP pool, DiagnosticSP diagnostic)
+{
+  if (pool)
+    ioService->post(boost::bind(&RadosFsChecker::checkInodes, this, pool,
+                                diagnostic));
+}
+
+void
+RadosFsChecker::checkInodes(DiagnosticSP diagnostic)
+{
+  std::vector<PoolSP> pools = mRadosFs->mPriv->getDataPools();
+  const std::vector<PoolSP> &mtdPools = mRadosFs->mPriv->getMtdPools();
+  pools.insert(pools.end(), mtdPools.begin(), mtdPools.end());
+
+  std::vector<PoolSP>::iterator it;
+  for (it = pools.begin(); it != pools.end(); it++)
+    checkInodesInThread((*it), diagnostic);
+}
+
+void
+RadosFsChecker::finishCheck(void)
+{
+  asyncWork.reset();
+  generalWorkerThreads.join_all();
+}
+
+void
+RadosFsChecker::animate()
+{
+  if (mVerbose)
+    return;
+
+  boost::unique_lock<boost::mutex> lock(mAnimationMutex);
+  boost::chrono::system_clock::time_point now = boost::chrono::system_clock::now();
+  boost::chrono::duration<double> timeDiff;
+  timeDiff = now - mAnimationLastUpdate;
+
+  if (timeDiff < boost::chrono::milliseconds(ANIMATION_STEP_TIMEOUT))
+    return;
+
+  mAnimationLastUpdate = now;
+  mAnimationStep %= mAnimation.length();
+
+  fprintf(stdout, " Checking %c\r", mAnimation[mAnimationStep++]);
+  fflush(stdout);
+}
+
+void
+RadosFsChecker::log(const char *msg, ...)
+{
+  if (!mVerbose)
+    return;
+
+  va_list args;
+
+  va_start(args, msg);
+
+  vfprintf(stderr, msg, args);
+
+  va_end(args);
+}
+
+PoolSP
+RadosFsChecker::getPool(const std::string &name)
+{
+  PoolSP pool = mRadosFs->mPriv->getDataPoolFromName(name);
+
+  if (!pool)
+    pool = mRadosFs->mPriv->getMtdPoolFromName(name);
+
+  if (!pool)
+  {
+    librados::IoCtx ioctx;
+    if (mRadosFs->mPriv->radosCluster.ioctx_create(name.c_str(), ioctx) == 0)
+      pool.reset(new Pool(name, 0, ioctx));
+  }
+
+  return pool;
+}
+
+void
+Issue::print(const std::map<ErrorCode, std::string> &errors)
+{
+  std::map<ErrorCode, std::string>::const_iterator it =
+      errors.find((ErrorCode) errorCode);
+
+  if (it != errors.end())
+  {
+    const std::string &error = (*it).second;
+    fprintf(stdout, "%-20s", error.c_str());
+  }
+  else
+  {
+    fprintf(stdout, "%-20d", errorCode);
+  }
+
+  fprintf(stdout, "   %s%s\n", path.c_str(),
+          extraInfo.empty() ? "" : (" : " + extraInfo).c_str());
+}
+
+void
+Diagnostic::addFileIssue(const Issue &issue)
+{
+  addIssue(issue, fileIssues, fileIssuesMutex, fileSolvedIssues,
+           fileSolvedIssuesMutex);
+}
+
+void
+Diagnostic::addDirIssue(const Issue &issue)
+{
+  addIssue(issue, dirIssues, dirIssuesMutex, dirSolvedIssues,
+           dirSolvedIssuesMutex);
+}
+
+void
+Diagnostic::addInodeIssue(const Issue &issue)
+{
+  addIssue(issue, inodeIssues, inodeIssuesMutex, inodeSolvedIssues,
+           inodeSolvedIssuesMutex);
+}
+
+void
+Diagnostic::addIssue(const Issue &issue, std::vector<Issue> &issues,
+                     boost::mutex &issuesMutex, std::vector<Issue> &fixedIssues,
+                     boost::mutex &fixedIssuesMutex)
+{
+  if (issue.fixed)
+  {
+    boost::unique_lock<boost::mutex> lock(fixedIssuesMutex);
+    fixedIssues.push_back(issue);
+  }
+  else
+  {
+    boost::unique_lock<boost::mutex> lock(issuesMutex);
+    issues.push_back(issue);
+  }
+}
+
+void
+Diagnostic::print(const std::map<ErrorCode, std::string> &errors, bool dry)
+{
+  fprintf(stdout, " Checking done \r");
+  fflush(stdout);
+
+  size_t totalIssues = fileIssues.size() + dirIssues.size() + inodeIssues.size();
+  fprintf(stdout, "\n\nIssues found: %lu\n", totalIssues);
+
+
+  std::vector<Issue>::iterator it;
+
+  if (totalIssues > 0)
+  {
+    fprintf(stdout, "\nFile issues: %lu\n", fileIssues.size());
+    for (it = fileIssues.begin(); it != fileIssues.end(); it++)
+    {
+      (*it).print(errors);
+    }
+
+    fprintf(stdout, "\nDirectory issues: %lu\n", dirIssues.size());
+    for (it = dirIssues.begin(); it != dirIssues.end(); it++)
+    {
+      (*it).print(errors);
+    }
+
+    fprintf(stdout, "\nInode issues: %lu\n", inodeIssues.size());
+    for (it = inodeIssues.begin(); it != inodeIssues.end(); it++)
+    {
+      (*it).print(errors);
     }
   }
 
-  return 0;
-}
-
-void
-printSet(const std::set<std::string> &set)
-{
-  if (set.size() == 0)
-    return;
-
-  std::set<std::string>::const_iterator it;
-
-  for (it = set.begin(); it != set.end(); it++)
+  if (fileSolvedIssues.size() > 0)
   {
-    fprintf(stdout, " %s\n", (*it).c_str());
-  }
-
-  fprintf(stdout, "---------------\n");
-}
-
-void
-printMap(const std::map<std::string, std::string> &map,
-         const std::string &valuePrefix)
-{
-  if (map.size() == 0)
-    return;
-
-  std::map<std::string, std::string>::const_iterator it;
-
-  for (it = map.begin(); it != map.end(); it++)
-  {
-    if (valuePrefix != "")
-      fprintf(stdout, " %s\t\t%s%s\n", (*it).first.c_str(),
-              valuePrefix.c_str(), (*it).second.c_str());
+    if (!dry)
+      fprintf(stdout, "\nFile issues solved: ");
     else
-      fprintf(stdout, " %s\n", (*it).first.c_str());
+      fprintf(stdout, "\nFile issues that would be solved: ");
+
+    fprintf(stdout, "%lu\n", fileSolvedIssues.size());
+
+    for (it = fileSolvedIssues.begin(); it != fileSolvedIssues.end(); it++)
+    {
+      (*it).print(errors);
+    }
   }
 
-  fprintf(stdout, "---------------\n");
-}
-
-void
-RadosFsChecker::printIssues(void)
-{
-  size_t totalIssues = mBrokenDirs.size() + mBrokenInodes.size() +
-                       mBrokenFiles.size() + mBrokenLinks.size() +
-                       mInodes.size() + mDirs.size();
-
-  fprintf(stdout, "\nTotal issues found: %lu\n\n", totalIssues);
-
-  if (totalIssues == 0)
-    return;
-
-  fprintf(stdout, "Indexed but missing dirs: %lu\n", mBrokenDirs.size());
-
-  if (mVerbose)
-    printMap(mBrokenDirs, "");
-
-  fprintf(stdout, "Existing but unindexed dirs: %lu\n", mBrokenDirs.size());
-
-  if (mVerbose)
-    printMap(mDirs, "");
-
-  fprintf(stdout, "Inodes without a file: %lu\n", mBrokenInodes.size());
-
-  if (mVerbose)
-    printMap(mBrokenInodes, "pool=");
-
-  fprintf(stdout, "Files pointing to unexisting inodes: %lu\n",
-          mBrokenFiles.size());
-
-  if (mVerbose)
-    printSet(mBrokenFiles);
-
-  fprintf(stdout, "Symbolic links to unexisting files/dirs: %lu\n",
-          mBrokenLinks.size());
-
-  if (mVerbose)
-    printMap(mBrokenLinks, "target=");
-}
-
-void
-RadosFsChecker::fix(void)
-{
-  check();
-
-  if (mDirs.size() == 0 && mInodes.size() == 0)
+  if (dirSolvedIssues.size() > 0)
   {
-    fprintf(stdout, "Nothing to fix. No unindexed or nonexistent directories "
-            "and no inodes without pointers.");
-    return;
+    if (!dry)
+      fprintf(stdout, "\nDir issues solved: ");
+    else
+      fprintf(stdout, "\nDir issues that would be solved: ");
+
+    fprintf(stdout, "%lu\n", dirSolvedIssues.size());
+
+    for (it = dirSolvedIssues.begin(); it != dirSolvedIssues.end(); it++)
+    {
+      (*it).print(errors);
+    }
   }
 
-  fixDirs();
-  fixInodes();
+  if (inodeSolvedIssues.size() > 0)
+  {
+    if (!dry)
+      fprintf(stdout, "\nInode issues solved: ");
+    else
+      fprintf(stdout, "\nInode issues that would be solved: ");
+
+    fprintf(stdout, "%lu\n", inodeSolvedIssues.size());
+
+    for (it = inodeSolvedIssues.begin(); it != inodeSolvedIssues.end(); it++)
+    {
+      (*it).print(errors);
+    }
+  }
 }

@@ -899,6 +899,29 @@ nameIsStripe(const std::string &name)
 }
 
 bool
+nameIsInode(const std::string &name)
+{
+  const size_t nameLength = name.length();
+  // we add 2 because of the // that comes before the stripe index
+  const size_t stripeLength = UUID_STRING_SIZE + FILE_STRIPE_LENGTH + 2;
+
+  return ((nameLength == UUID_STRING_SIZE || nameLength == stripeLength) &&
+          name[0] != '/');
+}
+
+std::string
+getBaseInode(const std::string &name)
+{
+  // we add 2 because of the // that comes before the stripe index
+  if (name.length() < UUID_STRING_SIZE)
+  {
+    return "";
+  }
+
+  return name.substr(0, UUID_STRING_SIZE);
+}
+
+bool
 isDirPath(const std::string &path)
 {
   return path[path.length() - 1] == PATH_SEP;
@@ -988,17 +1011,24 @@ createDirAndInode(const Stat *stat)
   return ret;
 }
 
-int
-createDirObject(const Stat *stat)
+std::string
+makeInodeXattr(const Stat *stat)
 {
   std::stringstream stream;
-  librados::ObjectWriteOperation writeOp;
 
   stream << LINK_KEY << "='" << stat->translatedPath << "' ";
   stream << POOL_KEY << "='" << stat->pool->name << "'";
 
+  return stream.str();
+}
+
+int
+createDirObject(const Stat *stat)
+{
+  librados::ObjectWriteOperation writeOp;
+
   std::map<std::string, librados::bufferlist> omap;
-  omap[XATTR_INODE].append(stream.str());
+  omap[XATTR_INODE].append(makeInodeXattr(stat));
 
   writeOp.create(true);
   writeOp.omap_set(omap);
@@ -1024,24 +1054,48 @@ void
 updateTimeAsync(const Stat *stat, const char *timeXAttrKey,
                 const std::string &time)
 {
-  updateTimeAsync2(stat->pool, stat->translatedPath, timeXAttrKey, time);
+  updateTimeAsyncInOmap(stat->pool, stat->translatedPath, timeXAttrKey, time);
 }
 
 void
-updateTimeAsync2(const PoolSP &pool, const std::string &inode,
-                 const char *timeXAttrKey,
-                 const std::string &time)
+updateTimeAsyncInOmap(const PoolSP &pool, const std::string &inode,
+                      const char *timeKey,
+                      const std::string &time)
 {
   std::map<std::string, librados::bufferlist> omap;
 
   if (time == "")
-    omap[timeXAttrKey].append(getCurrentTimeStr());
+    omap[timeKey].append(getCurrentTimeStr());
   else
-    omap[timeXAttrKey].append(time);
+    omap[timeKey].append(time);
 
   librados::ObjectWriteOperation op;
 
   op.omap_set(omap);
+
+  rados_completion_t comp;
+
+  rados_aio_create_completion(0, 0, updateTimeAsyncCB, &comp);
+  librados::AioCompletion completion((librados::AioCompletionImpl *)comp);
+
+  pool->ioctx.aio_operate(inode, &completion, &op);
+}
+
+void
+updateTimeAsyncInXAttr(const PoolSP &pool, const std::string &inode,
+                       const char *timeKey,
+                       const std::string &time)
+{
+  librados::bufferlist timeBl;
+
+  if (time == "")
+    timeBl.append(getCurrentTimeStr());
+  else
+    timeBl.append(time);
+
+  librados::ObjectWriteOperation op;
+
+  op.setxattr(timeKey, timeBl);
 
   rados_completion_t comp;
 
@@ -1259,4 +1313,60 @@ moveLogicalFile(Stat &oldParent, Stat &newParent,
   }
 
   return ret;
+}
+
+int
+getFileInodeBackLink(Pool *pool, const std::string &inode,
+                     std::string *backLink)
+{
+  librados::bufferlist buff;
+
+  int ret = pool->ioctx.getxattr(inode, XATTR_INODE_HARD_LINK, buff);
+
+  if (ret >= 0)
+  {
+    backLink->assign(buff.c_str(), 0, buff.length());
+    return 0;
+  }
+
+  return ret;
+}
+
+int
+getDirInodeBackLink(Pool *pool, const std::string &inode, std::string *backLink)
+{
+  std::set<std::string> keys;
+  std::map<std::string, librados::bufferlist> omap;
+
+  keys.insert(XATTR_INODE_HARD_LINK);
+
+  int ret = pool->ioctx.omap_get_vals_by_keys(inode, keys, &omap);
+
+  if (ret == 0 && omap.count(XATTR_INODE_HARD_LINK) > 0)
+  {
+    librados::bufferlist buff = omap[XATTR_INODE_HARD_LINK];
+    backLink->assign(buff.c_str(), 0, buff.length());
+  }
+
+  return ret;
+}
+
+int
+setFileInodeBackLink(Pool *pool, const std::string &inode,
+                     const std::string &backLink)
+{
+  librados::bufferlist buff;
+  buff.append(backLink);
+
+  return pool->ioctx.setxattr(inode, XATTR_INODE_HARD_LINK, buff);
+}
+
+int
+setDirInodeBackLink(Pool *pool, const std::string &inode,
+                    const std::string &backLink)
+{
+  std::map<std::string, librados::bufferlist> omap;
+  omap[XATTR_INODE_HARD_LINK].append(backLink);
+
+  return pool->ioctx.omap_set(inode, omap);
 }

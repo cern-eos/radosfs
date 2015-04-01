@@ -127,6 +127,10 @@ public:
 
   PoolList getDataPools(const std::string &path);
 
+  PoolList getDataPools(void);
+
+  PoolList getMtdPools(void);
+
   std::string poolPrefix(const std::string &pool,
                          PoolMap *map,
                          boost::mutex &mutex) const;
@@ -211,6 +215,10 @@ public:
   void checkFileLocks(void);
 
   boost::shared_ptr<boost::asio::io_service> getIoService();
+
+  int resetFileEntry(Stat &stat);
+
+  int resetDirLogicalObj(Stat &dirStat);
 
   Filesystem *radosFs;
   librados::Rados radosCluster;

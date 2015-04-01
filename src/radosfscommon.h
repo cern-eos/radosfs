@@ -180,6 +180,10 @@ std::string makeFileStripeName(const std::string &filePath, size_t stripeIndex);
 
 bool nameIsStripe(const std::string &name);
 
+bool nameIsInode(const std::string &name);
+
+std::string getBaseInode(const std::string &name);
+
 std::string getFileXAttrDirRecord(const Stat *stat);
 
 bool isDirPath(const std::string &path);
@@ -204,9 +208,13 @@ std::string getCurrentTimeStr(void);
 void updateTimeAsync(const Stat *stat, const char *timeXAttrKey,
                      const std::string &time = "");
 
-void updateTimeAsync2(const PoolSP &pool, const std::string &inode,
-                      const char *timeXAttrKey,
-                      const std::string &time = "");
+void updateTimeAsyncInOmap(const PoolSP &pool, const std::string &inode,
+                           const char *timeXAttrKey,
+                           const std::string &time = "");
+
+void updateTimeAsyncInXAttr(const PoolSP &pool, const std::string &inode,
+                            const char *timeKey,
+                            const std::string &time = "");
 
 int getTimeFromXAttr(const Stat *stat, const std::string &xattr,
                      timespec *spec, time_t *basicTime);
@@ -228,5 +236,19 @@ void setInodeBacklinkAsync(PoolSP pool, const std::string &backlink,
 int moveLogicalFile(Stat &oldParent, Stat &newParent,
                     const std::string &oldFilePath,
                     const std::string &newFilePath);
+
+int getFileInodeBackLink(Pool *pool, const std::string &inode,
+                         std::string *backLink);
+
+int getDirInodeBackLink(Pool *pool, const std::string &inode,
+                        std::string *backLink);
+
+int setFileInodeBackLink(Pool *pool, const std::string &inode,
+                         const std::string &backLink);
+
+int setDirInodeBackLink(Pool *pool, const std::string &inode,
+                        const std::string &backLink);
+
+std::string makeInodeXattr(const Stat *stat);
 
 #endif /* __RADOS_FS_COMMON_HH__ */
