@@ -28,6 +28,7 @@
 
 #include "FileIO.hh"
 #include "FileInode.hh"
+#include "Quota.hh"
 #include "RadosFsTest.hh"
 #include "radosfscommon.h"
 
@@ -4247,6 +4248,194 @@ TEST_F(RadosFsTest, ChownDir)
   radosFs.setIds(NOBODY_UID, NOBODY_UID);
 
   EXPECT_EQ(-EPERM, dir.chown(NOBODY_UID, NOBODY_UID));
+}
+
+TEST_F(RadosFsTest, Quota)
+{
+  AddPool();
+
+  size_t maxSize = 3 * MEGABYTE_CONVERSION;
+
+  // Create all dirs in path
+  radosfs::Dir dirC(&radosFs, "/a/b/c");
+
+  ASSERT_EQ(0, dirC.create(-1, true));
+
+  // Instance the other dirs in the path and check that they have no quota
+  // assigned
+
+  radosfs::Dir dirA(&radosFs, "/a/");
+
+  radosfs::Dir dirB(&radosFs, "/a/b/");
+
+  EXPECT_FALSE(dirA.hasQuota());
+
+  EXPECT_FALSE(dirB.hasQuota());
+
+  // Create a quota for the upper level dir
+
+  EXPECT_EQ(0, dirA.createQuota(maxSize));
+
+  // Check that all the subdirs now also have a quota set
+
+  dirC.update();
+
+  dirB.update();
+
+  EXPECT_TRUE(dirA.hasQuota());
+
+  EXPECT_TRUE(dirB.hasQuota());
+
+  EXPECT_TRUE(dirC.hasQuota());
+
+  // Get the quota assigned to the dirs
+
+  radosfs::Quota quota;
+
+  ASSERT_EQ(0, dirC.getQuota(quota));
+
+  // Check the quota's max size
+
+  radosfs::QuotaSize size = quota.getQuotaSize();
+
+  EXPECT_EQ(maxSize, size.max);
+
+  // Update and check the quota's current size
+
+  int64_t portion = maxSize / 3;
+
+  EXPECT_EQ(0, quota.updateCurrentSize(portion));
+
+  quota.update();
+
+  size = quota.getQuotaSize();
+
+  EXPECT_EQ(portion, size.current);
+
+  EXPECT_EQ(0, quota.updateCurrentSize(portion));
+
+  quota.update();
+
+  size = quota.getQuotaSize();
+
+  EXPECT_EQ(portion * 2, size.current);
+
+  EXPECT_EQ(0, quota.updateCurrentSize(portion));
+
+  quota.update();
+
+  size = quota.getQuotaSize();
+
+  EXPECT_EQ(portion * 3, size.current);
+
+  // Set quota sizes for users, groups and a new max size for the "project"
+
+  std::map<uid_t, radosfs::QuotaSize> userQuota, groupQuota;
+  int64_t userMaxSize = 0.5 * MEGABYTE_CONVERSION;
+  int64_t userCurrentSize = userMaxSize / 10;
+  int64_t groupMaxSize = userMaxSize * 2;
+  int64_t groupCurrentSize = groupMaxSize / 5;
+
+  size.max = maxSize * 2;
+  size.current = -1;
+
+  userQuota[TEST_UID].max = userMaxSize;
+  userQuota[TEST_UID].current = userCurrentSize;
+
+  userQuota[TEST_UID + 1].max = userMaxSize;
+  userQuota[TEST_UID + 1].current = userCurrentSize;
+
+  groupQuota[TEST_GID].max = groupMaxSize;
+  groupQuota[TEST_GID].current = groupCurrentSize;
+
+  groupQuota[TEST_GID + 1].max = userMaxSize;
+  groupQuota[TEST_GID + 1].current = groupCurrentSize;
+
+  EXPECT_EQ(0, quota.setQuotaSizes(&size, &userQuota, &groupQuota));
+
+  // Check the user quota
+
+  quota.update();
+
+  EXPECT_EQ(0, quota.getUserQuota(TEST_UID, size));
+
+  EXPECT_EQ(userMaxSize, size.max);
+
+  EXPECT_EQ(userCurrentSize, size.current);
+
+  // Update the user and group quotas' current size
+
+  std::map<uid_t, int64_t> users, groups;
+
+  users[TEST_UID] = -5;
+  users[TEST_UID + 1] = userCurrentSize;
+
+  groups[TEST_GID] = -10;
+  groups[TEST_GID + 1] = userCurrentSize;
+
+  EXPECT_EQ(0, quota.updateCurrentSizes(200, &users, &groups));
+
+  // Check that the user and group quotas match
+
+  quota.update();
+
+  EXPECT_EQ(0, quota.getUserQuota(TEST_UID, size));
+
+  EXPECT_EQ(userMaxSize, size.max);
+
+  EXPECT_EQ(userCurrentSize - 5, size.current);
+
+  EXPECT_EQ(0, quota.getUserQuota(TEST_UID + 1, size));
+
+  EXPECT_EQ(userMaxSize, size.max);
+
+  EXPECT_EQ(userCurrentSize * 2, size.current);
+
+  size.max = 0;
+  size.current = 0;
+
+  EXPECT_EQ(0, quota.getGroupQuota(TEST_GID, size));
+
+  EXPECT_EQ(groupMaxSize, size.max);
+
+  EXPECT_EQ(groupCurrentSize - 10, size.current);
+
+  EXPECT_EQ(0, quota.getGroupQuota(TEST_GID + 1, size));
+
+  EXPECT_EQ(userMaxSize, size.max);
+
+  EXPECT_EQ(groupCurrentSize + userCurrentSize, size.current);
+
+  // Check which users and groups are exceeding their quotas using a given
+  // difference
+
+  std::map<uid_t, radosfs::QuotaSize> exceedingUsers;
+  std::map<gid_t, radosfs::QuotaSize> exceedingGroups;
+
+  exceedingUsers = quota.getUsersExceedingQuotas();
+
+  EXPECT_EQ(0, exceedingUsers.size());
+
+  exceedingUsers = quota.getUsersExceedingQuotas(userMaxSize - userCurrentSize);
+
+  EXPECT_EQ(1, exceedingUsers.size());
+
+  exceedingUsers = quota.getUsersExceedingQuotas(userMaxSize - 1);
+
+  EXPECT_EQ(2, exceedingUsers.size());
+
+  exceedingGroups = quota.getGroupsExceedingQuotas();
+
+  EXPECT_EQ(0, exceedingGroups.size());
+
+  exceedingGroups =
+      quota.getGroupsExceedingQuotas(groupMaxSize - groupCurrentSize);
+
+  EXPECT_EQ(1, exceedingGroups.size());
+
+  exceedingGroups = quota.getGroupsExceedingQuotas(groupMaxSize - 1);
+
+  EXPECT_EQ(2, exceedingGroups.size());
 }
 
 GTEST_API_ int
