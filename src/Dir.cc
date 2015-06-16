@@ -24,6 +24,7 @@
 #include "DirPriv.hh"
 #include "FilesystemPriv.hh"
 #include "Finder.hh"
+#include "QuotaPriv.hh"
 
 RADOS_FS_BEGIN_NAMESPACE
 
@@ -69,6 +70,20 @@ DirPriv::updatePath()
   {
     updateDirInfoPtr();
   }
+}
+
+std::string
+DirPriv::getQuotaName() const
+{
+  const Stat *stat = fsStat();
+  std::map<std::string, std::string>::const_iterator it;
+
+  if ((it = stat->extraData.find(XATTR_QUOTA_OBJECT)) != stat->extraData.end())
+  {
+    return (*it).second;
+  }
+
+  return "";
 }
 
 bool
@@ -399,6 +414,35 @@ DirPriv::rename(const std::string &destination)
 
   radosFsPriv()->updateTMId(&parentStat);
   radosFsPriv()->updateTMId(oldParentStat);
+
+  return ret;
+}
+
+int
+DirPriv::setQuotaObject(const Quota &obj)
+{
+  std::map<std::string, librados::bufferlist> omap;
+  omap[XATTR_QUOTA_OBJECT].append(obj.name());
+
+  int ret = fsStat()->pool->ioctx.omap_set(fsStat()->translatedPath, omap);
+
+  dir->update();
+
+  std::set<std::string> entries;
+  dir->entryList(entries);
+
+  std::set<std::string>::const_iterator it;
+
+  for (it  = entries.begin(); it != entries.end(); it++)
+  {
+    const std::string entry = dir->path() + *it;
+    if (isDirPath(entry))
+    {
+      Dir subdir(dir->filesystem(), entry, false);
+      if (!subdir.isLink())
+        subdir.mPriv->setQuotaObject(obj);
+    }
+  }
 
   return ret;
 }
@@ -1567,6 +1611,49 @@ Dir::getTMId(std::string &id)
   }
 
   return ret;
+}
+
+int
+Dir::createQuota(int64_t maxSize)
+{
+  int ret = 0;
+
+  if (hasQuota())
+    return -EEXIST;
+
+  Quota quota;
+  const Stat *stat = mPriv->fsStat();
+  const std::string name = QUOTA_OBJ_PREFIX + stat->translatedPath;
+
+  ret = mPriv->getQuotaPriv(quota)->create(stat->pool, name, maxSize);
+
+  if (ret != 0 && ret != -EEXIST)
+  {
+    radosfs_debug("Error creating quota object for %s: %s (retcode=%d)",
+                  path().c_str(), strerror(abs(ret)), ret);
+    return ret;
+  }
+
+  mPriv->setQuotaObject(quota);
+
+  return ret;
+}
+
+int
+Dir::getQuota(Quota &quota) const
+{
+  std::string quotaName = mPriv->getQuotaName();
+
+  if (quotaName.empty())
+    return -ENOENT;
+
+  return mPriv->getQuotaPriv(quota)->load(quotaName, mPriv->fsStat()->pool);
+}
+
+bool
+Dir::hasQuota() const
+{
+  return !mPriv->getQuotaName().empty();
 }
 
 RADOS_FS_END_NAMESPACE

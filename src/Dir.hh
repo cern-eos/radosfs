@@ -25,6 +25,7 @@
 #include <set>
 
 #include "Filesystem.hh"
+#include "Quota.hh"
 #include "FsObj.hh"
 
 RADOS_FS_BEGIN_NAMESPACE
@@ -99,6 +100,12 @@ public:
   bool usingTMId(void);
 
   int getTMId(std::string &id);
+
+  int createQuota(int64_t maxSize = -1);
+
+  int getQuota(Quota &quota) const;
+
+  bool hasQuota(void) const;
 
 private:
   boost::scoped_ptr<DirPriv> mPriv;

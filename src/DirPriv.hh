@@ -25,6 +25,8 @@
 #include "radosfsdefines.h"
 #include "DirCache.hh"
 #include "Finder.hh"
+#include "Quota.hh"
+#include "QuotaPriv.hh"
 
 RADOS_FS_BEGIN_NAMESPACE
 
@@ -62,6 +64,12 @@ public:
   int rename(const std::string &newName);
 
   int moveDirTreeObjects(const Stat *oldDir, const Stat *newDir);
+
+  std::string getQuotaName(void) const;
+
+  int setQuotaObject(const Quota &obj);
+
+  QuotaPriv * getQuotaPriv(const Quota &quota) const { return quota.mPriv.get(); }
 
   Dir *dir;
   Dir *target;
